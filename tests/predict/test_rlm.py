@@ -651,6 +651,147 @@ class TestRLMDynamicSignature:
 
 
 # ============================================================================
+# Policy Field Tests
+# ============================================================================
+
+
+class TestRLMPolicyField:
+    """Tests for first-class 'policy' field support in RLM."""
+
+    def test_policy_field_in_action_signature(self):
+        """Policy field gets a dedicated slot in the action signature."""
+        import dspy
+
+        class PolicySig(dspy.Signature):
+            context: str = dspy.InputField(desc="The data to process")
+            policy: str = dspy.InputField(desc="Operational policy for the REPL agent.")
+            answer: str = dspy.OutputField()
+
+        rlm = RLM(PolicySig)
+        action_sig = rlm.generate_action.signature
+
+        assert "policy" in action_sig.input_fields
+        # Desc is propagated from the parent signature field.
+        policy_desc = action_sig.input_fields["policy"].json_schema_extra["desc"]
+        assert "Operational policy" in policy_desc
+        # Policy appears before variables_info (behavioral guidance first).
+        input_names = list(action_sig.input_fields.keys())
+        assert input_names.index("policy") < input_names.index("variables_info")
+
+    def test_policy_field_not_in_data_variable_listing(self):
+        """Policy field is excluded from the ACTION_INSTRUCTIONS_TEMPLATE 'inputs' listing."""
+        import dspy
+
+        class PolicySig(dspy.Signature):
+            context: str = dspy.InputField()
+            policy: str = dspy.InputField(desc="Operational policy for the REPL agent.")
+            answer: str = dspy.OutputField()
+
+        rlm = RLM(PolicySig)
+        instructions = rlm.generate_action.signature.instructions
+        # The template line "given the inputs {inputs}" should list context but not policy,
+        # because policy is a behavioral field, not a data variable.
+        assert "given the inputs `context`" in instructions
+        assert "given the inputs `context`, `policy`" not in instructions
+        # The "Available: Variables:" bullet should also exclude policy.
+        assert "Variables: `context`" in instructions
+        assert "Variables: `context`, `policy`" not in instructions
+
+    def test_no_policy_field_backward_compatible(self):
+        """Without a 'policy' field, the action signature is unchanged."""
+        rlm = RLM("context, query -> answer")
+        action_sig = rlm.generate_action.signature
+
+        assert "policy" not in action_sig.input_fields
+        assert "variables_info" in action_sig.input_fields
+        assert "repl_history" in action_sig.input_fields
+        assert "iteration" in action_sig.input_fields
+        # Both context and query appear in the instructions as data variables.
+        assert "`context`" in action_sig.instructions
+        assert "`query`" in action_sig.instructions
+
+    def test_policy_excluded_from_repl_variables(self):
+        """Policy field is not included in the REPL variables list."""
+        import dspy
+
+        class PolicySig(dspy.Signature):
+            context: str = dspy.InputField(desc="Data")
+            policy: str = dspy.InputField(desc="Behavioral guidance")
+            answer: str = dspy.OutputField()
+
+        rlm = RLM(PolicySig)
+        variables = rlm._build_variables(context="some data", policy="be concise")
+
+        names = [v.name for v in variables]
+        assert "policy" not in names
+        assert "context" in names
+
+    def test_policy_passed_to_generate_action(self):
+        """Policy value is forwarded as a dedicated kwarg to generate_action."""
+        import dspy
+
+        class PolicySig(dspy.Signature):
+            context: str = dspy.InputField()
+            policy: str = dspy.InputField(desc="Operational policy")
+            answer: str = dspy.OutputField()
+
+        captured: dict = {}
+
+        class CapturingPredictor:
+            def __call__(self, **kwargs):
+                captured.update(kwargs)
+                return Prediction(reasoning="done", code='SUBMIT("result")')
+
+        mock = MockInterpreter(responses=[FinalOutput({"answer": "result"})])
+        rlm = RLM(PolicySig, max_iterations=3, interpreter=mock)
+        rlm.generate_action = CapturingPredictor()
+
+        rlm.forward(context="data", policy="always be concise")
+
+        assert "policy" in captured
+        assert captured["policy"] == "always be concise"
+
+    def test_policy_field_default_desc_when_no_explicit_desc(self):
+        """A policy field with no custom desc gets the generic fallback description."""
+        rlm = RLM("context, policy -> answer")
+        action_sig = rlm.generate_action.signature
+
+        assert "policy" in action_sig.input_fields
+        desc = action_sig.input_fields["policy"].json_schema_extra.get("desc", "")
+        assert len(desc) > 0
+
+    @pytest.mark.asyncio
+    async def test_aforward_passes_policy_to_generate_action(self):
+        """Async forward also passes policy as a dedicated kwarg to generate_action."""
+        import dspy
+
+        class PolicySig(dspy.Signature):
+            context: str = dspy.InputField()
+            policy: str = dspy.InputField(desc="Policy")
+            answer: str = dspy.OutputField()
+
+        captured: dict = {}
+
+        class CapturingPredictor:
+            def __call__(self, **kwargs):
+                captured.update(kwargs)
+                return Prediction(reasoning="done", code='SUBMIT("result")')
+
+            async def acall(self, **kwargs):
+                captured.update(kwargs)
+                return Prediction(reasoning="done", code='SUBMIT("result")')
+
+        mock = MockInterpreter(responses=[FinalOutput({"answer": "result"})])
+        rlm = RLM(PolicySig, max_iterations=3, interpreter=mock)
+        rlm.generate_action = CapturingPredictor()
+
+        await rlm.aforward(context="data", policy="use metrics before submitting")
+
+        assert "policy" in captured
+        assert captured["policy"] == "use metrics before submitting"
+
+
+# ============================================================================
 # Integration Tests: PythonInterpreter (require Deno)
 # ============================================================================
 

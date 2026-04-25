@@ -113,6 +113,12 @@ class RLM(Module):
     Create separate RLM instances for concurrent use, or use the default
     PythonInterpreter which creates a fresh instance per forward() call.
 
+    When the signature includes an input field named ``policy``, RLM gives it
+    dedicated, prominent placement in every ``generate_action`` call — appearing
+    before ``variables_info`` as a first-class behavioral directive rather than
+    being listed as a code-accessible data variable.  This makes the policy text
+    easy to optimize with GEPA's ``optimize_anything``.
+
     Examples:
         ```python
         # Basic usage
@@ -121,6 +127,8 @@ class RLM(Module):
         print(result.output)
         ```
     """
+
+    _POLICY_FIELD_NAME: str = "policy"
 
     def __init__(
         self,
@@ -286,7 +294,9 @@ class RLM(Module):
 
     def _build_signatures(self) -> tuple[Signature, Signature]:
         """Build the action and extract signatures from templates."""
-        inputs_str = ", ".join(f"`{n}`" for n in self.signature.input_fields)
+        # Exclude the policy field from the data-variable listing; it gets its own dedicated slot.
+        non_policy_inputs = [n for n in self.signature.input_fields if n != self._POLICY_FIELD_NAME]
+        inputs_str = ", ".join(f"`{n}`" for n in non_policy_inputs) if non_policy_inputs else "(none)"
 
         # Simple names for SUBMIT() examples
         final_output_names = ", ".join(self.signature.output_fields.keys())
@@ -313,6 +323,26 @@ class RLM(Module):
             .append("reasoning", dspy.OutputField(desc="Think step-by-step: what do you know? What remains? Plan your next action."), type_=str)
             .append("code", dspy.OutputField(desc="Python code to execute. Use markdown code block format: ```python\\n<code>\\n```"), type_=str)
         )
+
+        # If the parent signature has a 'policy' field, give it a dedicated slot before variables_info
+        # so the LLM sees behavioral guidance first, not buried among data variables.
+        if self._POLICY_FIELD_NAME in self.signature.input_fields:
+            policy_field_info = self.signature.input_fields[self._POLICY_FIELD_NAME]
+            policy_desc = "Operational policy and behavioral guidelines for this REPL session"
+            if (
+                policy_field_info
+                and hasattr(policy_field_info, "json_schema_extra")
+                and policy_field_info.json_schema_extra
+            ):
+                raw = policy_field_info.json_schema_extra.get("desc", "")
+                if raw and not raw.startswith("${"):
+                    policy_desc = raw
+            policy_annotation = getattr(policy_field_info, "annotation", str)
+            action_sig = action_sig.prepend(
+                self._POLICY_FIELD_NAME,
+                dspy.InputField(desc=policy_desc),
+                type_=policy_annotation,
+            )
 
         # Extract signature: includes the original signature's output fields and task instructions.
         extract_instructions = """Based on the REPL trajectory, extract the final outputs now.
@@ -355,6 +385,9 @@ class RLM(Module):
         """Build REPLVariable list from input arguments with field metadata."""
         variables = []
         for name, value in input_args.items():
+            # Policy is surfaced as a dedicated action-sig field, not as a REPL data variable.
+            if name == self._POLICY_FIELD_NAME and name in self.signature.input_fields:
+                continue
             field_info = self.signature.input_fields.get(name)
             variables.append(REPLVariable.from_value(name, value, field_info=field_info))
         return variables
@@ -549,11 +582,14 @@ class RLM(Module):
     ) -> Prediction | REPLHistory:
         """Execute one iteration. Returns Prediction if done, else updated REPLHistory."""
         variables_info = [variable.format() for variable in variables]
-        action = self.generate_action(
+        action_kwargs: dict[str, Any] = dict(
             variables_info=variables_info,
             repl_history=history,
             iteration=f"{iteration + 1}/{self.max_iterations}",
         )
+        if self._POLICY_FIELD_NAME in self.signature.input_fields:
+            action_kwargs[self._POLICY_FIELD_NAME] = input_args.get(self._POLICY_FIELD_NAME, "")
+        action = self.generate_action(**action_kwargs)
         if self.verbose:
             logger.info(
                 f"RLM iteration {iteration + 1}/{self.max_iterations}\n"
@@ -637,11 +673,14 @@ class RLM(Module):
     ) -> Prediction | REPLHistory:
         """Async version: Execute one iteration."""
         variables_info = [variable.format() for variable in variables]
-        pred = await self.generate_action.acall(
+        action_kwargs: dict[str, Any] = dict(
             variables_info=variables_info,
             repl_history=history,
             iteration=f"{iteration + 1}/{self.max_iterations}",
         )
+        if self._POLICY_FIELD_NAME in self.signature.input_fields:
+            action_kwargs[self._POLICY_FIELD_NAME] = input_args.get(self._POLICY_FIELD_NAME, "")
+        pred = await self.generate_action.acall(**action_kwargs)
         if self.verbose:
             logger.info(
                 f"RLM iteration {iteration + 1}/{self.max_iterations}\n"
